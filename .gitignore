@@ -1,0 +1,14 @@
+/.idea
+/.vscode
+/.cursor
+/.cursorrules
+**/node_modules
+**/vendor
+
+/.docker/*/data/*
+/.docker/*/logs/*
+
+**/package-lock.json
+**/.env
+**/.env.production
+**/.env.backup
