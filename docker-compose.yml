@@ -1,0 +1,81 @@
+services:
+  nginx:
+    image: nginx:latest
+    ports:
+      - "8080:80"
+    volumes:
+      - ./.docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - cognify-net
+
+  backend:
+    build:
+      context: .
+      dockerfile: .docker/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - kg_data:/app/data
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      infinity:
+        condition: service_started
+    networks:
+      - cognify-net
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "echo 'Frontend service placeholder. In a real scenario, you would run a dev server here.' && tail -f /dev/null"
+    volumes:
+      - ./frontend:/app
+    networks:
+      - cognify-net
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cognify}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_DB: ${POSTGRES_DB:-cognify_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-cognify} -d ${POSTGRES_DB:-cognify_db}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cognify-net
+
+  infinity:
+    image: infiniflow/infinity:nightly
+    ports:
+      - "23817:23817"
+      - "9090:9090"
+    volumes:
+      - infinity_data:/var/infinity
+    networks:
+      - cognify-net
+
+networks:
+  cognify-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  kg_data:
+  infinity_data:
