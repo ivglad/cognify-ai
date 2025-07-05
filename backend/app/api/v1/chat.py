@@ -8,7 +8,7 @@ router = APIRouter()
 async def handle_chat_request(request: ChatRequest):
     """
     Handles a user's chat query, performs a search, and returns an answer
-    along with the updated conversation history.
+    along with the updated conversation history and sources.
     """
-    answer, history = await search_service.search(request)
-    return ChatResponse(answer=answer, sources=[], history=history) 
+    answer, history, sources = await search_service.search(request)
+    return ChatResponse(answer=answer, sources=sources, history=history) 

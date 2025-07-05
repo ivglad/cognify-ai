@@ -31,4 +31,7 @@ class Settings(BaseSettings):
     INFINITY_HOST: str = "infinity"
     INFINITY_PORT: int = 23817
 
+    # Spacy settings
+    SPACY_MODEL_NAME: str = "ru_core_news_sm" # "ru_core_news_md" for higher accuracy
+
 settings = Settings() 

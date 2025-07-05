@@ -42,4 +42,4 @@ def setup_logging():
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    print("Logging configured.") 
+    print("Логирование настроено.") 

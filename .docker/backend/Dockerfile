@@ -33,14 +33,17 @@ COPY --from=builder /install /usr/local
 # Set the WORKDIR
 WORKDIR /app
 
-# Copy the application code first, so we can run a command against it
-COPY ./backend/ /app/
-
-# Download NLTK data required for text processing
+# Download models before copying app code to leverage caching
+# This layer will be cached unless requirements.txt changes
 RUN python -m nltk.downloader punkt punkt_tab stopwords
 
-# Download Spacy model for NER
-RUN python -m spacy download ru_core_news_sm
+# Install both Spacy models for flexibility via environment variable
+# This allows switching between models without rebuilding the container
+RUN python -m spacy download ru_core_news_sm && \
+    python -m spacy download ru_core_news_md
+
+# Copy the application code
+COPY ./backend/ /app/
 
 # Copy the entrypoint script
 COPY ./backend/entrypoint.sh /app/entrypoint.sh

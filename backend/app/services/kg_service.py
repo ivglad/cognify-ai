@@ -4,11 +4,11 @@ import kuzu
 import os
 from pathlib import Path
 from app.core.config import settings
-from typing import List, Tuple
 import ast
 import asyncio
 import re
 import threading
+import time
 
 from app.llm.factory import llm
 
@@ -20,13 +20,15 @@ class KnowledgeGraphService:
         self._conn = None
         self._connection_failed = False  # Флаг для отключения KG при проблемах
         self._retry_count = 0
-        self._lock = threading.Lock()  # Для потокобезопасности
+        self._init_lock = threading.Lock()  # Только для инициализации
+        self._operation_timeout = 30.0  # Timeout для операций в секундах
         
         try:
-            self.nlp = spacy.load("ru_core_news_sm")
-            logger.info("Spacy model 'ru_core_news_sm' loaded successfully.")
+            logger.info(f"Загрузка Spacy модели: '{settings.SPACY_MODEL_NAME}'...")
+            self.nlp = spacy.load(settings.SPACY_MODEL_NAME)
+            logger.info("Spacy модель загружена для KnowledgeGraphService.")
         except OSError:
-            logger.error("Spacy model 'ru_core_news_sm' not found. Please run 'python -m spacy download ru_core_news_sm'")
+            logger.error(f"Spacy модель '{settings.SPACY_MODEL_NAME}' не найдена. Выполните 'python -m spacy download {settings.SPACY_MODEL_NAME}'")
             # Fallback to a blank model to avoid crashing the app on startup
             self.nlp = spacy.blank("ru")
 
@@ -34,34 +36,36 @@ class KnowledgeGraphService:
         self._init_database()
 
     def _init_database(self):
-        """Инициализирует базу данных Kuzu"""
-        try:
-            # Создаем директорию для базы данных
-            db_path = Path("/app/data/knowledge_graph")
-            db_path.mkdir(parents=True, exist_ok=True)
-            
-            logger.info(f"Initializing Kuzu database at {db_path}")
-            
-            # Создаем базу данных и подключение
-            self._db = kuzu.Database(str(db_path))
-            self._conn = kuzu.Connection(self._db)
-            
-            # Создаем схему графа знаний
-            self._create_schema()
-            
-            self._retry_count = 0
-            logger.info("Kuzu database initialized successfully")
-            
-        except Exception as e:
-            self._retry_count += 1
-            logger.error(f"Failed to initialize Kuzu database (attempt {self._retry_count}): {e}")
-            if self._retry_count >= 3:
-                self._connection_failed = True
-                logger.warning("Knowledge Graph disabled after 3 failed initialization attempts")
-            else:
-                # Пробуем еще раз через некоторое время
-                self._db = None
-                self._conn = None
+        """Инициализирует базу данных Kuzu с retry логикой"""
+        with self._init_lock:  # Только для инициализации
+            try:
+                # Создаем директорию для базы данных
+                db_path = Path("/app/data/knowledge_graph")
+                db_path.mkdir(parents=True, exist_ok=True)
+                
+                logger.info(f"Инициализация БД Kuzu в {db_path}")
+                
+                # Создаем базу данных и подключение
+                self._db = kuzu.Database(str(db_path))
+                self._conn = kuzu.Connection(self._db)
+                
+                # Создаем схему графа знаний
+                self._create_schema()
+                
+                self._retry_count = 0
+                self._connection_failed = False
+                logger.info("БД Kuzu инициализирована успешно")
+                
+            except Exception as e:
+                self._retry_count += 1
+                logger.error(f"Ошибка инициализации БД Kuzu (попытка {self._retry_count}): {e}")
+                if self._retry_count >= 3:
+                    self._connection_failed = True
+                    logger.warning("Knowledge Graph отключен после 3 неудачных попыток инициализации")
+                else:
+                    # Пробуем еще раз через некоторое время
+                    self._db = None
+                    self._conn = None
 
     def _create_schema(self):
         """Создает схему графа знаний в Kuzu"""
@@ -83,11 +87,14 @@ class KnowledgeGraphService:
                 )
             """)
             
+            # Исправленная схема Entity с поддержкой дубликатов между документами
             self._conn.execute("""
                 CREATE NODE TABLE IF NOT EXISTS Entity(
+                    id STRING,
                     name STRING, 
-                    type STRING, 
-                    PRIMARY KEY(name)
+                    type STRING,
+                    document_id STRING,
+                    PRIMARY KEY(id)
                 )
             """)
             
@@ -111,10 +118,10 @@ class KnowledgeGraphService:
                 )
             """)
             
-            logger.info("Knowledge graph schema created successfully")
+            logger.info("Схема графа знаний создана успешно")
             
         except Exception as e:
-            logger.error(f"Failed to create schema: {e}")
+            logger.error(f"Ошибка создания схемы: {e}")
             raise
 
     def _ensure_connection(self):
@@ -127,6 +134,26 @@ class KnowledgeGraphService:
             
         if self._db is None or self._conn is None:
             raise Exception("Failed to establish Kuzu connection")
+
+    def _execute_with_timeout(self, query: str, parameters: dict = None):
+        """
+        Выполняет запрос с timeout для избежания зависаний
+        """
+        def execute_query():
+            if parameters:
+                return self._conn.execute(query, parameters=parameters)
+            else:
+                return self._conn.execute(query)
+        
+        # Используем asyncio.wait_for эквивалент для sync кода
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(execute_query)
+            try:
+                return future.result(timeout=self._operation_timeout)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"Timeout запроса Kuzu после {self._operation_timeout}с: {query[:100]}...")
+                raise TimeoutError(f"Query timeout after {self._operation_timeout}s")
 
     def _clean_llm_response(self, response_text: str) -> str:
         """
@@ -165,11 +192,11 @@ class KnowledgeGraphService:
                 # Kuzu database закрывается автоматически при удалении объекта
                 self._db = None
                 
-            logger.info("Kuzu connection closed.")
+            logger.info("Подключение Kuzu закрыто.")
         except Exception as e:
-            logger.error(f"Error closing Kuzu connection: {e}")
+            logger.error(f"Ошибка закрытия подключения Kuzu: {e}")
 
-    async def _extract_relations_with_llm(self, sentence: str) -> List[Tuple[str, str, str]]:
+    async def _extract_relations_with_llm(self, sentence: str) -> list[tuple[str, str, str]]:
         """
         Uses an LLM to extract relationships (subject, relation, object) from a sentence.
         Optimized prompt with enhanced validation and clearer instructions.
@@ -219,7 +246,7 @@ class KnowledgeGraphService:
                 relations = ast.literal_eval(response_text)
             except (ValueError, SyntaxError) as parse_error:
                 # Пробуем альтернативный парсинг
-                logger.debug(f"Primary parsing failed, trying alternative: {parse_error}")
+                logger.debug(f"Первичный парсинг не удался, пробуем альтернативный: {parse_error}")
                 
                 # Ищем список в скобках
                 import re
@@ -228,14 +255,14 @@ class KnowledgeGraphService:
                     try:
                         relations = ast.literal_eval('[' + match.group(1) + ']')
                     except (ValueError, SyntaxError):
-                        logger.warning(f"Alternative parsing also failed for: '{response_text[:100]}...'")
+                        logger.warning(f"Альтернативный парсинг также не удался для: '{response_text[:100]}...'")
                         return []
                 else:
-                    logger.warning(f"No list pattern found in response: '{response_text[:100]}...'")
+                    logger.warning(f"Не найден паттерн списка в ответе: '{response_text[:100]}...'")
                     return []
             
             if not isinstance(relations, list):
-                logger.warning(f"LLM returned non-list response: {type(relations)}")
+                logger.warning(f"LLM вернул не список: {type(relations)}")
                 return []
                 
             # Проверяем и фильтруем валидные отношения
@@ -246,189 +273,261 @@ class KnowledgeGraphService:
                     if all(isinstance(item, str) and item.strip() for item in rel):
                         valid_relations.append(tuple(str(item).strip() for item in rel))
                     else:
-                        logger.debug(f"Invalid relation elements: {rel}")
+                        logger.debug(f"Невалидные элементы отношения: {rel}")
                 else:
-                    logger.debug(f"Invalid relation format: {rel}")
+                    logger.debug(f"Невалидный формат отношения: {rel}")
                     
             if valid_relations:
-                logger.info(f"Extracted {len(valid_relations)} relations from '{sentence[:50]}...'")
+                logger.info(f"Извлечено {len(valid_relations)} отношений из '{sentence[:50]}...'")
             return valid_relations
             
         except Exception as e:
-            logger.error(f"LLM relation extraction failed for sentence '{sentence[:50]}...': {e}", exc_info=True)
+            logger.error(f"Ошибка извлечения отношений LLM для предложения '{sentence[:50]}...': {e}", exc_info=True)
             return []
 
-    async def add_document_and_extract_entities(self, document_id: str, document_name: str, text_chunks: List[str]):
+    async def add_document_and_extract_entities(self, document_id: str, document_name: str, text_chunks: list[str]):
         """
         Processes text chunks to extract entities, relationships and build the knowledge graph.
+        Неблокирующая версия без глобальной блокировки.
         """
         if self._connection_failed:
-            logger.warning("Knowledge Graph processing skipped - Kuzu is disabled")
+            logger.warning("Обработка Knowledge Graph пропущена - Kuzu отключен")
             return
-            
+        
+        start_time = time.time()
+        timeout_exceeded = False
+        
         try:
-            with self._lock:  # Обеспечиваем потокобезопасность
-                self._ensure_connection()
+            # Проверяем подключение без блокировки
+            self._ensure_connection()
+            
+            logger.info(f"Начало обработки Knowledge Graph для документа {document_id} ({document_name})")
+            
+            # Создаем узел документа с timeout
+            try:
+                self._execute_with_timeout(
+                    "MERGE (d:Document {id: $id, name: $name})",
+                    {"id": document_id, "name": document_name}
+                )
+                logger.debug(f"Создан узел документа для {document_id}")
+            except TimeoutError:
+                logger.warning(f"Timeout создания документа для {document_id}")
+                timeout_exceeded = True
+            except Exception as doc_error:
+                logger.debug(f"Документ '{document_id}' уже существует или ошибка создания: {doc_error}")
+
+            if timeout_exceeded:
+                logger.warning(f"Обработка Knowledge Graph прервана для {document_id} из-за timeout")
+                return
+
+            # Обрабатываем чанки с ограничением времени
+            processed_chunks = 0
+            max_chunks_per_timeout = 10  # Ограничиваем количество чанков для избежания зависаний
+            
+            for i, chunk in enumerate(text_chunks[:max_chunks_per_timeout]):  # Ограничиваем количество чанков
+                if time.time() - start_time > self._operation_timeout:
+                    logger.warning(f"Превышен глобальный timeout для документа {document_id}, обработано {processed_chunks} чанков")
+                    timeout_exceeded = True
+                    break
+                    
+                chunk_id = f"{document_id}_chunk_{i}"
                 
-                # Создаем узел документа
                 try:
-                    self._conn.execute(
-                        "MERGE (d:Document {id: $id, name: $name})",
-                        parameters={"id": document_id, "name": document_name}
+                    # Создаем узел чанка и связываем с документом с timeout
+                    self._execute_with_timeout(
+                        "MERGE (c:Chunk {id: $chunk_id, text: $text})",
+                        {"chunk_id": chunk_id, "text": chunk}
                     )
-                except Exception as doc_error:
-                    logger.debug(f"Document '{document_id}' already exists or error creating: {doc_error}")
-
-                for i, chunk in enumerate(text_chunks):
-                    chunk_id = f"{document_id}_chunk_{i}"
                     
-                    # Создаем узел чанка и связываем с документом
-                    try:
-                        self._conn.execute(
-                            "MERGE (c:Chunk {id: $chunk_id, text: $text})",
-                            parameters={"chunk_id": chunk_id, "text": chunk}
-                        )
-                    except Exception as chunk_error:
-                        logger.debug(f"Chunk '{chunk_id}' already exists or error creating: {chunk_error}")
+                    self._execute_with_timeout(
+                        """
+                        MATCH (d:Document {id: $doc_id}), (c:Chunk {id: $chunk_id})
+                        MERGE (d)-[:CONTAINS_CHUNK]->(c)
+                        """,
+                        {"doc_id": document_id, "chunk_id": chunk_id}
+                    )
                     
-                    try:
-                        self._conn.execute(
-                            """
-                            MATCH (d:Document {id: $doc_id}), (c:Chunk {id: $chunk_id})
-                            MERGE (d)-[:CONTAINS_CHUNK]->(c)
-                            """,
-                            parameters={"doc_id": document_id, "chunk_id": chunk_id}
-                        )
-                    except Exception as contains_error:
-                        logger.debug(f"Error creating CONTAINS_CHUNK relation: {contains_error}")
-
                     # Извлекаем сущности из чанка
                     doc = self.nlp(chunk)
                     for ent in doc.ents:
-                        # Создаем узел сущности и связываем с чанком - безопасно
                         try:
-                            self._conn.execute(
-                                "MERGE (e:Entity {name: $name, type: $type})",
-                                parameters={"name": ent.text, "type": ent.label_}
+                            self._execute_with_timeout(
+                                "MERGE (e:Entity {id: $id, name: $name, type: $type, document_id: $doc_id})",
+                                {"id": f"{document_id}_{ent.text}", "name": ent.text, "type": ent.label_, "doc_id": document_id}
                             )
-                        except Exception as ent_error:
-                            logger.debug(f"Entity '{ent.text}' already exists or error creating: {ent_error}")
-                        
-                        try:
-                            self._conn.execute(
+                            
+                            self._execute_with_timeout(
                                 """
-                                MATCH (c:Chunk {id: $chunk_id}), (e:Entity {name: $name})
+                                MATCH (c:Chunk {id: $chunk_id}), (e:Entity {id: $id})
                                 MERGE (c)-[:MENTIONS]->(e)
                                 """,
-                                parameters={"chunk_id": chunk_id, "name": ent.text}
+                                {"chunk_id": chunk_id, "id": f"{document_id}_{ent.text}"}
                             )
-                        except Exception as rel_error:
-                            logger.debug(f"Error creating MENTIONS relation for '{ent.text}': {rel_error}")
+                        except TimeoutError:
+                            logger.debug(f"Timeout обработки сущности для {ent.text} в документе {document_id}")
+                            continue
+                        except Exception as ent_error:
+                            logger.debug(f"Ошибка обработки сущности '{ent.text}': {ent_error}")
+                            continue
                     
-                    # Извлекаем и сохраняем отношения между сущностями в предложениях
+                    # Извлекаем отношения с ограничением по времени
                     for sent in doc.sents:
-                        # Фильтрация неподходящих предложений
+                        if time.time() - start_time > self._operation_timeout * 0.8:  # 80% от timeout
+                            break
+                            
                         sent_text = sent.text.strip()
                         
-                        # Пропускаем слишком короткие или длинные предложения
+                        # Фильтрация неподходящих предложений
                         if len(sent_text) < 10 or len(sent_text) > 500:
                             continue
                             
-                        # Пропускаем предложения без букв (только числа/символы)
                         if not any(c.isalpha() for c in sent_text):
                             continue
                             
-                        # Пропускаем предложения с слишком много заглавных букв (вероятно, таблицы)
                         if sum(1 for c in sent_text if c.isupper()) > len(sent_text) * 0.5:
                             continue
                         
-                        if len(sent.ents) > 1:  # Обрабатываем только предложения с несколькими сущностями
-                            relations = await self._extract_relations_with_llm(sent_text)
-                            for subj, rel, obj in relations:
-                                # Создаем сущности если они не существуют - используем безопасный подход
-                                try:
-                                    self._conn.execute(
-                                        "MERGE (e1:Entity {name: $subj, type: 'EXTRACTED'})",
-                                        parameters={"subj": subj}
-                                    )
-                                except Exception as e1:
-                                    logger.debug(f"Entity '{subj}' already exists or error creating: {e1}")
+                        if len(sent.ents) > 1:
+                            try:
+                                # Добавляем timeout для LLM вызова
+                                relations = await asyncio.wait_for(
+                                    self._extract_relations_with_llm(sent_text),
+                                    timeout=10.0  # 10 секунд на LLM запрос
+                                )
                                 
-                                try:
-                                    self._conn.execute(
-                                        "MERGE (e2:Entity {name: $obj, type: 'EXTRACTED'})",
-                                        parameters={"obj": obj}
-                                    )
-                                except Exception as e2:
-                                    logger.debug(f"Entity '{obj}' already exists or error creating: {e2}")
-                                
-                                # Создаем отношение
-                                try:
-                                    self._conn.execute(
-                                        """
-                                        MATCH (e1:Entity {name: $subj}), (e2:Entity {name: $obj})
-                                        MERGE (e1)-[:RELATION {type: $rel}]->(e2)
-                                        """,
-                                        parameters={"subj": subj, "rel": rel, "obj": obj}
-                                    )
-                                except Exception as e3:
-                                    logger.debug(f"Error creating relation between '{subj}' and '{obj}': {e3}")
+                                for subj, rel, obj in relations:
+                                    try:
+                                        self._execute_with_timeout(
+                                            "MERGE (e1:Entity {id: $id, name: $subj, type: 'EXTRACTED', document_id: $doc_id})",
+                                            {"id": f"{document_id}_{subj}", "subj": subj, "doc_id": document_id}
+                                        )
+                                        
+                                        self._execute_with_timeout(
+                                            "MERGE (e2:Entity {id: $id, name: $obj, type: 'EXTRACTED', document_id: $doc_id})",
+                                            {"id": f"{document_id}_{obj}", "obj": obj, "doc_id": document_id}
+                                        )
+                                        
+                                        self._execute_with_timeout(
+                                            """
+                                            MATCH (e1:Entity {id: $id1}), (e2:Entity {id: $id2})
+                                            MERGE (e1)-[:RELATION {type: $rel}]->(e2)
+                                            """,
+                                            {"id1": f"{document_id}_{subj}", "id2": f"{document_id}_{obj}", "rel": rel}
+                                        )
+                                    except TimeoutError:
+                                        logger.debug(f"Timeout создания отношения для {subj}-{rel}-{obj}")
+                                        continue
+                                    except Exception as rel_error:
+                                        logger.debug(f"Ошибка создания отношения: {rel_error}")
+                                        continue
+                                        
+                            except asyncio.TimeoutError:
+                                logger.debug(f"Timeout извлечения отношений LLM для предложения в документе {document_id}")
+                                continue
+                            except Exception as llm_error:
+                                logger.debug(f"Ошибка извлечения отношений LLM: {llm_error}")
+                                continue
+                    
+                    processed_chunks += 1
+                    
+                except TimeoutError:
+                    logger.warning(f"Timeout обработки чанка для чанка {i} в документе {document_id}")
+                    continue
+                except Exception as chunk_error:
+                    logger.debug(f"Ошибка обработки чанка для чанка {i}: {chunk_error}")
+                    continue
 
-                logger.info(f"Processed {len(text_chunks)} chunks for document {document_id} and updated knowledge graph.")
+            end_time = time.time()
+            processing_time = end_time - start_time
+            
+            if timeout_exceeded:
+                logger.warning(f"Обработка Knowledge Graph для документа {document_id} завершена с timeouts. "
+                              f"Обработано {processed_chunks}/{len(text_chunks)} чанков за {processing_time:.2f}с")
+            else:
+                logger.info(f"Успешно обработан Knowledge Graph для {document_name} "
+                           f"({processed_chunks}/{len(text_chunks)} чанков за {processing_time:.2f}с)")
                 
         except Exception as e:
-            logger.error(f"Failed to process knowledge graph for document {document_id}: {e}", exc_info=True)
+            logger.error(f"Ошибка обработки графа знаний для документа {document_id}: {e}", exc_info=True)
             # Не прерываем выполнение, просто логируем ошибку
 
-    async def find_related_entities(self, query: str) -> List[str]:
+    async def find_related_entities(self, query: str) -> list[str]:
         """
         Finds entities related to a given query string by looking for co-occurring entities in the same documents.
+        Неблокирующая версия с timeout.
         """
         if self._connection_failed:
-            logger.debug("Knowledge Graph search skipped - Kuzu is disabled")
+            logger.debug("Поиск Knowledge Graph пропущен - Kuzu отключен")
             return []
             
         doc = self.nlp(query)
         query_entities = [ent.text for ent in doc.ents]
 
         if not query_entities:
-            logger.debug("No entities found in the query to search for in the knowledge graph.")
+            logger.debug("В запросе не найдено сущностей для поиска в графе знаний.")
             return []
 
-        logger.debug(f"Found entities in query: {query_entities}. Searching for related entities in Kuzu.")
+        logger.debug(f"Найдены сущности в запросе: {query_entities}. Поиск связанных сущностей в Kuzu.")
         
         try:
-            with self._lock:  # Обеспечиваем потокобезопасность
-                self._ensure_connection()
-                related_entities = set()
+            self._ensure_connection()
+            related_entities = set()
 
-                for entity_name in query_entities:
-                    # Находим связанные сущности через документы
+            for entity_name in query_entities:
+                try:
+                    # Находим связанные сущности через документы (с новой схемой) - с timeout
                     cypher_query = """
-                    MATCH (start_entity:Entity {name: $entity_name})<-[:MENTIONS]-(:Chunk)<-[:CONTAINS_CHUNK]-(doc:Document)
+                    MATCH (start_entity:Entity)<-[:MENTIONS]-(:Chunk)<-[:CONTAINS_CHUNK]-(doc:Document)
+                    WHERE start_entity.name = $entity_name
                     MATCH (doc)-[:CONTAINS_CHUNK]->(:Chunk)-[:MENTIONS]->(related_entity:Entity)
-                    WHERE start_entity.name <> related_entity.name
-                    RETURN DISTINCT related_entity.name AS name
+                    WHERE start_entity.id <> related_entity.id
+                    RETURN DISTINCT related_entity.name AS name, related_entity.document_id AS doc_id
                     LIMIT 10
                     """
                     
-                    result = self._conn.execute(cypher_query, parameters={"entity_name": entity_name})
+                    result = self._execute_with_timeout(cypher_query, {"entity_name": entity_name})
                     
                     # Получаем результаты
                     while result.has_next():
                         record = result.get_next()
-                        related_entities.add(record[0])  # Получаем значение по индексу
+                        entity_name_result = record[0]
+                        doc_id = record[1]
+                        # Добавляем информацию о документе для контекста
+                        related_entities.add(f"{entity_name_result} (из документа {doc_id[:8]}...)")
+                    
+                    # Также ищем прямые отношения между сущностями
+                    relation_query = """
+                    MATCH (start_entity:Entity)-[:RELATION]->(related_entity:Entity)
+                    WHERE start_entity.name = $entity_name
+                    RETURN DISTINCT related_entity.name AS name, related_entity.document_id AS doc_id
+                    LIMIT 5
+                    """
+                    
+                    result = self._execute_with_timeout(relation_query, {"entity_name": entity_name})
+                    
+                    while result.has_next():
+                        record = result.get_next()
+                        entity_name_result = record[0]
+                        doc_id = record[1]
+                        related_entities.add(f"{entity_name_result} (связана с {entity_name})")
+                        
+                except TimeoutError:
+                    logger.warning(f"Timeout поиска связанных сущностей для '{entity_name}'")
+                    continue
+                except Exception as search_error:
+                    logger.debug(f"Ошибка поиска связанных сущностей для '{entity_name}': {search_error}")
+                    continue
             
             # Убираем исходные сущности запроса из результата
-            final_related_entities = list(related_entities - set(query_entities))
+            final_related_entities = list(related_entities)
             
             if final_related_entities:
-                logger.info(f"Found related entities in KG: {final_related_entities}")
+                logger.info(f"Найдены связанные сущности в KG: {final_related_entities}")
                 
             return final_related_entities
             
         except Exception as e:
-            logger.warning(f"Failed to find related entities in Kuzu: {e}")
+            logger.warning(f"Ошибка поиска связанных сущностей в Kuzu: {e}")
             return []  # Возвращаем пустой список при ошибке
 
 kg_service = KnowledgeGraphService() 

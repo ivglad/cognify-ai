@@ -24,7 +24,7 @@ class InfinityClient:
         if self._initialized:
             return
             
-        logger.info(f"Initializing centralized Infinity client connection to {settings.INFINITY_HOST}:{settings.INFINITY_PORT}")
+        logger.info(f"Инициализация центр. клиента Infinity {settings.INFINITY_HOST}:{settings.INFINITY_PORT}")
         
         try:
             self._client = infinity.connect(
@@ -34,21 +34,21 @@ class InfinityClient:
             # Обеспечиваем существование базы данных по умолчанию
             try:
                 self._client.get_database("default")
-                logger.info("Connected to existing 'default' database in Infinity")
+                logger.info("Подключение к существующей БД 'default' в Infinity")
             except Exception:
                 self._client.create_database("default")
-                logger.info("Created 'default' database in Infinity")
+                logger.info("Создана БД 'default' в Infinity")
                 
             self._initialized = True
-            logger.info("Centralized Infinity client initialized successfully")
+            logger.info("Центр. клиент Infinity инициализирован успешно")
             
         except Exception as e:
-            logger.error(f"Failed to initialize Infinity client: {e}", exc_info=True)
+            logger.error(f"Ошибка инициализации клиента Infinity: {e}", exc_info=True)
             raise
     
     def reconnect(self):
         """Принудительное переподключение к Infinity DB"""
-        logger.info("Forcing reconnection to Infinity DB...")
+        logger.info("Принудительное переподключение к Infinity DB...")
         self._initialized = False
         self._client = None
         self.__init__()
@@ -70,7 +70,7 @@ class InfinityClient:
             tables = db.list_tables()
             return tables
         except Exception as e:
-            logger.error(f"Failed to list tables in database '{db_name}': {e}")
+            logger.error(f"Ошибка получения списка таблиц в БД '{db_name}': {e}")
             return []
     
     def table_exists(self, table_name: str, db_name: str = "default"):
@@ -97,7 +97,7 @@ class InfinityClient:
                 else:
                     row_count = 0
             except Exception as count_error:
-                logger.warning(f"Could not count rows in table '{table_name}': {count_error}")
+                logger.warning(f"Не удалось подсчитать строки в таблице '{table_name}': {count_error}")
                 row_count = "unknown"
             
             return {"exists": True, "row_count": row_count}

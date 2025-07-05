@@ -17,7 +17,7 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # Инициализация централизованного Infinity клиента при старте
-logger.info("Application startup: Infinity client initialized")
+logger.info("Запуск приложения: клиент Infinity инициализирован")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -38,7 +38,7 @@ async def log_requests(request: Request, call_next):
        request.url.path == f"{settings.API_V1_STR}/chat":
         
         processing_time = (end_time - start_time) * 1000
-        logger.info(f"Request {request.method} {request.url.path} completed in {processing_time:.2f}ms. Status code: {response.status_code}")
+        logger.info(f"Запрос {request.method} {request.url.path} выполнен за {processing_time:.2f}мс. Код: {response.status_code}")
     
     return response
 

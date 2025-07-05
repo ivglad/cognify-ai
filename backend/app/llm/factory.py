@@ -3,7 +3,6 @@ import asyncio
 import time
 import threading
 import concurrent.futures
-from typing import List, Iterator, Any
 from langchain_core.language_models import BaseLLM, LLM
 from langchain_core.embeddings import Embeddings
 from langchain_community.chat_models.gigachat import GigaChat
@@ -26,7 +25,7 @@ grpc_executor = concurrent.futures.ThreadPoolExecutor(
 )
 
 # Логируем инициализацию thread pool
-logger.info(f"Initialized gRPC thread pool with {grpc_executor._max_workers} workers to isolate from uvloop")
+logger.info(f"Инициализирован gRPC пул {grpc_executor._max_workers} потоков для изоляции от uvloop")
 
 class LLMResponse:
     """Простая обертка для ответа LLM с атрибутом content"""
@@ -81,7 +80,7 @@ def get_llm() -> BaseLLM:
     Factory function to get the language model instance based on the provider setting.
     """
     provider = settings.LLM_PROVIDER.lower()
-    logger.info(f"Initializing LLM for provider: {provider}")
+    logger.info(f"Инициализация LLM для провайдера: {provider}")
 
     if provider == "yandex":
         if not settings.YANDEX_API_KEY or not settings.YANDEX_FOLDER_ID:
@@ -113,7 +112,7 @@ def get_embedding_model() -> Embeddings:
     Factory function to get the embedding model instance based on the provider setting.
     """
     provider = settings.EMBEDDING_PROVIDER.lower()
-    logger.info(f"Initializing embedding model for provider: {provider}")
+    logger.info(f"Инициализация модели эмбеддингов для провайдера: {provider}")
 
     if provider == "yandex":
         if not settings.YANDEX_API_KEY or not settings.YANDEX_FOLDER_ID:
@@ -127,10 +126,14 @@ def get_embedding_model() -> Embeddings:
                 self._doc_model = None
                 self._query_model = None
                 
-                # Rate limiting: максимум 10 запросов в секунду
+                # Оптимизированный rate limiting для батчей
                 self._request_times = []
                 self._lock = threading.Lock()
                 self._max_requests_per_second = 10
+                # Burst allowance - позволяет несколько быстрых запросов подряд
+                self._burst_capacity = 3
+                self._burst_tokens = 3
+                self._last_refill = time.time()
                 
             def _init_models(self):
                 """Инициализация моделей в thread pool"""
@@ -140,12 +143,19 @@ def get_embedding_model() -> Embeddings:
                     self._query_model = sdk.models.text_embeddings("query")
                 return self._doc_model, self._query_model
                 
-            def _wait_for_rate_limit(self):
+            def _wait_for_rate_limit_optimized(self, batch_size: int = 1):
                 """
-                Обеспечивает соблюдение лимита 10 запросов в секунду.
+                Оптимизированный rate limiting с поддержкой burst requests и батчей.
                 """
                 with self._lock:
                     current_time = time.time()
+                    
+                    # Refill burst tokens
+                    time_passed = current_time - self._last_refill
+                    tokens_to_add = int(time_passed * self._max_requests_per_second)
+                    if tokens_to_add > 0:
+                        self._burst_tokens = min(self._burst_capacity, self._burst_tokens + tokens_to_add)
+                        self._last_refill = current_time
                     
                     # Удаляем запросы старше 1 секунды
                     self._request_times = [
@@ -153,59 +163,90 @@ def get_embedding_model() -> Embeddings:
                         if current_time - req_time < 1.0
                     ]
                     
-                    # Если достигнут лимит, ждем
-                    if len(self._request_times) >= self._max_requests_per_second:
-                        sleep_time = 1.0 - (current_time - self._request_times[0])
-                        if sleep_time > 0:
-                            logger.debug(f"Rate limit reached, sleeping for {sleep_time:.3f} seconds")
-                            time.sleep(sleep_time)
-                            # Обновляем время после сна
-                            current_time = time.time()
-                            # Очищаем старые запросы снова
-                            self._request_times = [
-                                req_time for req_time in self._request_times 
-                                if current_time - req_time < 1.0
-                            ]
+                    # Проверяем можем ли использовать burst tokens
+                    if batch_size <= self._burst_tokens and len(self._request_times) + batch_size <= self._max_requests_per_second:
+                        self._burst_tokens -= batch_size
+                        for _ in range(batch_size):
+                            self._request_times.append(current_time)
+                        return  # Можем выполнить запрос сразу
                     
-                    # Добавляем текущий запрос
-                    self._request_times.append(current_time)
+                    # Стандартный rate limiting с проверкой на пустой список
+                    if len(self._request_times) + batch_size > self._max_requests_per_second:
+                        # Проверяем что список не пустой перед обращением к [0]
+                        if self._request_times:
+                            sleep_time = 1.0 - (current_time - self._request_times[0])
+                            if sleep_time > 0:
+                                estimated_sleep = sleep_time + (batch_size * 0.1)  # Дополнительная пауза для батча
+                                logger.debug(f"Достигнут лимит запросов, пауза {estimated_sleep:.3f}с для батча {batch_size}")
+                                time.sleep(estimated_sleep)
+                                # Обновляем время после сна
+                                current_time = time.time()
+                                # Очищаем старые запросы снова
+                                self._request_times = [
+                                    req_time for req_time in self._request_times 
+                                    if current_time - req_time < 1.0
+                                ]
+                        else:
+                            # Если список пустой, просто ждем минимальную паузу
+                            logger.debug(f"Список запросов пуст, минимальная пауза для батча {batch_size}")
+                            time.sleep(batch_size * 0.1)
+                            current_time = time.time()
+                    
+                    # Добавляем текущие запросы
+                    for _ in range(batch_size):
+                        self._request_times.append(current_time)
             
-            def _sync_embed_documents(self, texts: List[str]) -> List[List[float]]:
-                """Синхронная версия для thread pool"""
+            def _wait_for_rate_limit(self):
+                """
+                Backward compatibility - обеспечивает соблюдение лимита 10 запросов в секунду.
+                """
+                return self._wait_for_rate_limit_optimized(1)
+            
+            def _sync_embed_documents(self, texts: list[str]) -> list[list[float]]:
+                """Оптимизированная синхронная версия для батчей"""
                 doc_model, _ = self._init_models()
                 embeddings = []
+                
+                # Для батчей проверяем rate limit один раз для всего батча
+                self._wait_for_rate_limit_optimized(len(texts))
+                
+                batch_start_time = time.time()
                 for i, text in enumerate(texts):
-                    self._wait_for_rate_limit()
+                    # Не используем _wait_for_rate_limit здесь, так как уже учли батч выше
                     embedding = doc_model.run(text)
                     embeddings.append(embedding)
                     
-                    if (i + 1) % 5 == 0:
-                        logger.debug(f"Processed {i + 1}/{len(texts)} embeddings")
+                    if (i + 1) % 10 == 0:
+                        logger.debug(f"Обработано {i + 1}/{len(texts)} эмбеддингов в батче")
+                
+                batch_duration = time.time() - batch_start_time        
+                logger.debug(f"Завершен батч эмбеддингов {len(texts)} за {batch_duration:.2f}с "
+                           f"(среднее {batch_duration/len(texts):.3f}с на элемент)")
                         
                 return embeddings
             
-            def _sync_embed_query(self, text: str) -> List[float]:
+            def _sync_embed_query(self, text: str) -> list[float]:
                 """Синхронная версия для thread pool"""
                 _, query_model = self._init_models()
                 self._wait_for_rate_limit()
                 return query_model.run(text)
             
-            def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            def embed_documents(self, texts: list[str]) -> list[list[float]]:
                 """Создание эмбеддингов для документов (синхронный интерфейс)."""
                 # Это будет вызываться из asyncio.to_thread в ingestion_service
                 return self._sync_embed_documents(texts)
             
-            def embed_query(self, text: str) -> List[float]:
+            def embed_query(self, text: str) -> list[float]:
                 """Создание эмбеддинга для запроса (синхронный интерфейс)."""
                 # Это будет вызываться из asyncio.to_thread в search_service
                 return self._sync_embed_query(text)
             
-            async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+            async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
                 """Асинхронное создание эмбеддингов для документов."""
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(grpc_executor, self._sync_embed_documents, texts)
             
-            async def aembed_query(self, text: str) -> List[float]:
+            async def aembed_query(self, text: str) -> list[float]:
                 """Асинхронное создание эмбеддинга для запроса."""
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(grpc_executor, self._sync_embed_query, text)
