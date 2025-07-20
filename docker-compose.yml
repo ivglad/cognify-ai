@@ -19,13 +19,14 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
-      - kg_data:/app/data
     env_file:
       - .env
     depends_on:
       postgres:
         condition: service_healthy
       infinity:
+        condition: service_started
+      redis:
         condition: service_started
     networks:
       - cognify-net
@@ -62,7 +63,7 @@ services:
       - cognify-net
 
   infinity:
-    image: infiniflow/infinity:nightly
+    image: infiniflow/infinity:v0.6.0-dev3
     ports:
       - "23817:23817"
       - "9090:9090"
@@ -77,5 +78,4 @@ networks:
 
 volumes:
   postgres_data:
-  kg_data:
   infinity_data:

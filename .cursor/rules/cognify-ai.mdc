@@ -1,0 +1,59 @@
+---
+alwaysApply: true
+---
+
+# Project: Cognify AI
+
+## General Instructions
+
+- Thoroughly check the attached sources and instructions - they have the highest priority.
+- Strive to use the most up-to-date information (as of 2025) using web search, MCP, if this information does not contradict the attached sources.
+- Analyze the project and all necessary files before each response.
+- If the user asks to write a plan, wait for confirmation of actions after its description.
+- Automatically fix linting errors.
+
+## Sources
+
+- **Infinity**
+- **Kuzu**
+
+## Tech Stack
+
+- **Backend:** Python 3.11+, FastAPI 0.100+
+- **Vector Store:** [Infinity | infiniflow.org]()
+- **RAG:** Used in document processing
+- **Orchestration LLM:** LangChain (Chain, Agent, Memory)
+- **Embedding Models:** Yandex-embedder, Giga-embedder, and OpenRouter for LLM access
+- **Hybrid Search:** Hybrid search using nltk + spacy + Infinity + Kuzu
+- **Knowledge Graph:** [Kuzu | kuzudb.com]()
+- **Frontend:** Tauri 2.6 + Vue 3.5 + Pinia + Vue Router + WebSocket API (future)
+
+## Code Commenting Rules
+
+All code comments must comply with the following rules:
+
+- All comments must be in **RUSSIAN**.
+- Comments must be placed above each function, block of non-obvious logic, or block requiring description.
+- Comments must be concise and convey the essence of the logic.
+- Comments must be single-line.
+- Comments should not describe "why" it was created, only the logic.
+
+### Examples of Code Commenting:
+
+**Incorrect:**
+
+- "Creating a full-text index"
+- "Changing query logic"
+- "Using an asynchronous method for embeddings"
+- "Ensuring default database existence"
+
+**Correct:**
+
+- "Full-text search"
+- "Query logic"
+- "Asynchronous method for embeddings"
+- "Default database"
+
+## Git Rules
+
+- Never execute git commands (git add, commit, pull, push, etc.). Only the user can do this.

@@ -1,6 +1,9 @@
 /.idea
 /.vscode
-/.cursor
+/.cursor/*
+!/.cursor/rules
+/.gemini/*
+!/.gemini/GEMINI.md
 /.cursorrules
 **/node_modules
 **/vendor
