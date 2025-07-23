@@ -19,6 +19,8 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      - kg_data:/app/data
+      - models_cache:/app/models
     env_file:
       - .env
     depends_on:
@@ -26,8 +28,10 @@ services:
         condition: service_healthy
       infinity:
         condition: service_started
+      elasticsearch:
+        condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     networks:
       - cognify-net
 
@@ -72,6 +76,47 @@ services:
     networks:
       - cognify-net
 
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - cognify-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2'
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - cognify-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
 networks:
   cognify-net:
     driver: bridge
@@ -79,3 +124,7 @@ networks:
 volumes:
   postgres_data:
   infinity_data:
+  elasticsearch_data:
+  redis_data:
+  kg_data:
+  models_cache:
